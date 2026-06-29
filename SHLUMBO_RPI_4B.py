@@ -205,14 +205,26 @@ def run_benchmark():
 
 # --- LIVE MODE (HEADLESS) ---
 def run_live():
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    # GStreamer pipeline to pull frames from the OV5647 ribbon camera
+    ingest_pipe = (
+        f"libcamerasrc ! video/x-raw, width={W}, height={H}, framerate={TARGET_FPS}/1 "
+        f"! videoconvert ! appsink drop=true max-buffers=1"
+    )
+    
+    # Tell OpenCV to read the camera via GStreamer
+    cap = cv2.VideoCapture(ingest_pipe, cv2.CAP_GSTREAMER)
     
     if not cap.isOpened(): 
-        raise RuntimeError("Could not open camera")
+        # Fallback for older Raspberry Pi operating systems
+        print("libcamerasrc failed, trying legacy v4l2src...")
+        legacy_pipe = (
+            f"v4l2src device=/dev/video0 ! video/x-raw, width={W}, height={H}, framerate={TARGET_FPS}/1 "
+            f"! videoconvert ! appsink drop=true max-buffers=1"
+        )
+        cap = cv2.VideoCapture(legacy_pipe, cv2.CAP_GSTREAMER)
+        
+        if not cap.isOpened():
+            raise RuntimeError("Could not open OV5647 camera via GStreamer.")
     
     encoder = EncoderThread(OUTPUT_PATH, W, H, TARGET_FPS)
     encoder.start()
