@@ -1,4 +1,4 @@
-# SHLUMBO_RPI_4B_V3.py - Optimized for Raspberry Pi 4B
+# SHLUMBO_RPI_4B_V3.py - Optimized for Raspberry Pi 4B (Headless UDP)
 import cv2
 import numpy as np
 import time
@@ -9,14 +9,12 @@ import os
 
 # --- CONFIGURATION ---
 W, H, TARGET_FPS = 320, 240, 24
-OUTPUT_PATH = "10.0.0.253" #"shlumbo_out.mp4"
-BENCH_MODE, BENCH_SECONDS, WARMUP_FRAMES = True, 10, 30
+OUTPUT_PATH = "10.0.0.253" 
+BENCH_MODE, BENCH_SECONDS, WARMUP_FRAMES = False, 10, 30
 _PI4B_REF = {'resize_gray': 0.013, 'motion': 0.008, 'color_lut': 0.010}
 
 # --- ENCODER THREAD ---
-# --- ENCODER THREAD ---
 class EncoderThread(threading.Thread):
-    # Replaced mp4mux and filesink with mpegtsmux and udpsink
     _GSTR_HW = 'appsrc ! videoconvert ! v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! h264parse ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
     _GSTR_SW = 'appsrc ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
 
@@ -205,7 +203,7 @@ def run_benchmark():
     encoder.stop()
     print_report(stage_times, frame_times, encoder)
 
-# --- LIVE MODE ---
+# --- LIVE MODE (HEADLESS) ---
 def run_live():
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
@@ -225,30 +223,25 @@ def run_live():
         pass
     
     pipeline = ShlumboPipeline()
-    cv2.namedWindow("SHLUMBO", cv2.WINDOW_NORMAL)
-    last_t = time.perf_counter()
+    
+    print("Live stream active. Press Ctrl+C to stop.")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            
+            out, _ = pipeline.process(frame)
+            if out is None: continue
+            
+            encoder.submit(out)
+            
+    except KeyboardInterrupt:
+        print("\nStopping pipeline...")
         
-        out, _ = pipeline.process(frame)
-        if out is None: continue
-        
-        encoder.submit(out)
-        now = time.perf_counter()
-        fps = 1.0 / (now - last_t)
-        last_t = now
-        
-        cv2.putText(out, f"FPS:{fps:.1f}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.imshow("SHLUMBO", out)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'): 
-            break
-
-    encoder.stop()
-    cap.release()
-    cv2.destroyAllWindows()
+    finally:
+        encoder.stop()
+        cap.release()
 
 if __name__ == "__main__":
     if BENCH_MODE:
