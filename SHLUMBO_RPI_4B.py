@@ -8,15 +8,14 @@ import statistics
 import os
 
 # --- CONFIGURATION ---
-W, H, TARGET_FPS = 320, 240, 24  # Change FPS to 30 for perfectly smooth cadence, or 24 for cinematic texture
+W, H, TARGET_FPS = 320, 240, 30  # Change FPS to 30 for perfectly smooth cadence, or 24 for cinematic texture
 OUTPUT_PATH = "10.0.0.253"       # Mac IP address for UDP streaming
-BENCH_MODE, BENCH_SECONDS, WARMUP_FRAMES = False, 10, 30
+BENCH_MODE, BENCH_SECONDS, WARMUP_FRAMES = True, 10, 30
 
 # --- ENCODER THREAD ---
 class EncoderThread(threading.Thread):
     _GSTR_HW = 'appsrc ! videoconvert ! v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! h264parse ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
-    _GSTR_SW = 'appsrc ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
-
+    _GSTR_SW = 'appsrc ! video/x-raw, format=BGR ! videoconvert ! video/x-raw, format=I420 ! x264enc speed-preset=ultrafast tune=zerolatency threads=4 bitrate=800 ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
     def __init__(self, path, width, height, fps):
         super().__init__(daemon=True)
         self.path, self.width, self.height, self.fps = path, width, height, fps
