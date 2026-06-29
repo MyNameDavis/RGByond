@@ -1,4 +1,4 @@
-# SHLUMBO_RPI_4B_V3.py - Optimized for Raspberry Pi 4B (Headless UDP)
+# SHLUMBO_RPI_4B_V3.py - Headless UDP Stream (libcamera optimized)
 import cv2
 import numpy as np
 import time
@@ -8,10 +8,9 @@ import statistics
 import os
 
 # --- CONFIGURATION ---
-W, H, TARGET_FPS = 320, 240, 24
-OUTPUT_PATH = "10.0.0.253" 
+W, H, TARGET_FPS = 320, 240, 24  # Change FPS to 30 for perfectly smooth cadence, or 24 for cinematic texture
+OUTPUT_PATH = "10.0.0.253"       # Mac IP address for UDP streaming
 BENCH_MODE, BENCH_SECONDS, WARMUP_FRAMES = False, 10, 30
-_PI4B_REF = {'resize_gray': 0.013, 'motion': 0.008, 'color_lut': 0.010}
 
 # --- ENCODER THREAD ---
 class EncoderThread(threading.Thread):
@@ -23,14 +22,14 @@ class EncoderThread(threading.Thread):
         self.path, self.width, self.height, self.fps = path, width, height, fps
         self.q = queue.Queue(maxsize=4)
         self.dropped, self.encoded = 0, 0
-        self.latencies = []
         self._running = True
         self._writer, self._backend = None, "pending"
 
     def _open_writer(self):
         for gst, label in [
-            (self._GSTR_HW.format(path=self.path), "HW GStreamer"),
-            (self._GSTR_SW.format(path=self.path), "SW GStreamer")
+            # SW GStreamer moved to the top!
+            (self._GSTR_SW.format(path=self.path), "SW GStreamer"),
+            (self._GSTR_HW.format(path=self.path), "HW GStreamer")
         ]:
             try:
                 w = cv2.VideoWriter(gst, cv2.CAP_GSTREAMER, 0, self.fps, (self.width, self.height))
@@ -39,21 +38,15 @@ class EncoderThread(threading.Thread):
             except Exception:
                 pass
 
-        path_avi = self.path.replace(".mp4", ".avi")
-        w = cv2.VideoWriter(path_avi, cv2.VideoWriter_fourcc(*'MJPG'), self.fps, (self.width, self.height))
-        if w.isOpened(): return w, "MJPEG"
-        return None, "None"
-
     def run(self):
         self._writer, self._backend = self._open_writer()
         while self._running:
             try:
-                frame, enqueue_t = self.q.get(timeout=0.5)
+                frame, _ = self.q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if self._writer:
                 self._writer.write(frame)
-            self.latencies.append(time.perf_counter() - enqueue_t)
             self.encoded += 1
 
     def submit(self, frame):
@@ -90,15 +83,6 @@ class ShlumboPipeline:
         self._active_u8 = np.zeros((H, W), dtype=np.uint8)
         self._mapped = np.zeros((H, W, 3), dtype=np.uint8)
 
-    def set_params(self, **kw):
-        old_bs = self.block_size
-        for k, v in kw.items():
-            if hasattr(self, k):
-                setattr(self, k, max(1, v) if k == 'block_size' else v)
-        if self.block_size != old_bs:
-            self._alloc_buffers()
-            self._prev_gray = None
-
     def _build_lut(self, shift_norm):
         base, offset = self._lut_base, int(shift_norm * 256)
         b = ((base + offset) & 255).astype(np.uint8)
@@ -107,20 +91,15 @@ class ShlumboPipeline:
         return np.stack([b, g, r], axis=-1).reshape(256, 1, 3)
 
     def process(self, frame):
-        bs, times = self.block_size, {}
+        bs = self.block_size
 
-        # Resize & Grayscale
-        t = time.perf_counter()
         small = cv2.resize(frame, (W // bs, H // bs), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        times['resize_gray'] = time.perf_counter() - t
 
         if self._prev_gray is None:
             self._prev_gray = gray.copy()
-            return None, {}
+            return None
 
-        # Motion Detection
-        t = time.perf_counter()
         diff = cv2.absdiff(gray, self._prev_gray)
         cv2.threshold(diff, int(self.motion_th * 255), 255, cv2.THRESH_BINARY, dst=self._mask_small)
         cv2.resize(self._mask_small, (W, H), dst=self._mask_hr, interpolation=cv2.INTER_NEAREST)
@@ -128,22 +107,18 @@ class ShlumboPipeline:
         decay_u8, inv_u8 = int(self.decay * 255), 255 - int(self.decay * 255)
         self._motion_accum = ((self._motion_accum.astype(np.uint16) * decay_u8) >> 8).astype(np.uint8)
         self._motion_accum += ((self._mask_hr.astype(np.uint16) * inv_u8) >> 8).astype(np.uint8)
-        times['motion'] = time.perf_counter() - t
 
-        # LUT Color Shift
-        t = time.perf_counter()
         now = time.perf_counter() - self._t0
         phase = (self.rot_freq * now + (self.osc_amp / 360.0) * np.sin(2 * np.pi * self.osc_freq * now))
 
         self._mapped[:] = cv2.LUT(frame, self._build_lut(phase % 1.0))
         cv2.threshold(self._motion_accum, 5, 255, cv2.THRESH_BINARY, dst=self._active_u8)
         cv2.copyTo(self._mapped, self._active_u8, frame)
-        times['color_lut'] = time.perf_counter() - t
 
         self._prev_gray[:] = gray
-        return frame, times
+        return frame
 
-# --- SYNTHETIC CAMERA ---
+# --- SYNTHETIC CAMERA (FOR BENCHMARKING) ---
 class SyntheticCamera:
     def __init__(self):
         self._idx = 0
@@ -160,71 +135,23 @@ class SyntheticCamera:
         cv2.circle(b, (cx, cy), 60, 200, -1)
         return True, np.stack([b, np.roll(b, i % 30, 1), np.roll(b, -(i % 20), 0)], axis=2)
 
-# --- REPORT & BENCHMARKING ---
-def print_report(stage_times, frame_times, encoder):
-    BUDGET = 1.0 / TARGET_FPS
-    STAGE_RATIO = {'resize_gray': 15, 'motion': 14, 'color_lut': 12}
-    
-    s_host = {k: statistics.mean(v) for k, v in stage_times.items()}
-    s_pi = {k: s_host[k] * STAGE_RATIO[k] for k in s_host}
-    total_host, total_pi = sum(s_host.values()), sum(s_pi.values())
-    
-    print(f"\n--- SHLUMBO V3 Pi 4B Report ---\n{W}x{H} @ {TARGET_FPS} fps")
-    for stage in s_host:
-        print(f"{stage:<16} Host: {s_host[stage]*1000:>6.2f}ms | Pi: {s_pi[stage]*1000:>6.2f}ms")
-    print(f"TOTAL            Host: {total_host*1000:>6.2f}ms | Pi: {total_pi*1000:>6.2f}ms")
-    print(f"-> Est Pi FPS: {1.0 / total_pi if total_pi else 0:.1f} | Enc: {encoder.backend} | Dropped: {encoder.dropped}")
-
-def run_benchmark():
-    print("\nSHLUMBO V3 Benchmark\n")
-    encoder = EncoderThread(OUTPUT_PATH, W, H, TARGET_FPS)
-    encoder.start()
-    time.sleep(0.5)
-
-    cam = SyntheticCamera()
-    pipeline = ShlumboPipeline()
-    stage_times = {'resize_gray': [], 'motion': [], 'color_lut': []}
-    frame_times = []
-
-    for _ in range(WARMUP_FRAMES):
-        pipeline.process(cam.read()[1])
-
-    t_start = time.perf_counter()
-    while (time.perf_counter() - t_start < BENCH_SECONDS):
-        _, frame = cam.read()
-        t0 = time.perf_counter()
-        out, times = pipeline.process(frame)
-        
-        if out is None: continue
-        for k, v in times.items(): stage_times[k].append(v)
-        frame_times.append(time.perf_counter() - t0)
-        encoder.submit(out)
-
-    encoder.stop()
-    print_report(stage_times, frame_times, encoder)
-
 # --- LIVE MODE (HEADLESS) ---
 def run_live():
-    # GStreamer pipeline to pull frames from the OV5647 ribbon camera
+    # 1. Pull native 640x480 @ 60fps from ArduCAM via libcamera
+    # 2. Decimate down to TARGET_FPS via videorate
+    # 3. Scale cleanly to 320x240 for the BARPHF pipeline
+   # Added format=BGR to the final caps filter
     ingest_pipe = (
-        f"libcamerasrc ! video/x-raw, width={W}, height={H}, framerate={TARGET_FPS}/1 "
-        f"! videoconvert ! appsink drop=true max-buffers=1"
-    )
+        f"libcamerasrc ! video/x-raw, width=640, height=480, framerate=60/1 "
+        f"! videorate ! video/x-raw, framerate={TARGET_FPS}/1 "
+        f"! videoconvert ! videoscale ! video/x-raw, width={W}, height={H}, format=BGR "
+        f"! appsink drop=true max-buffers=1"
+    ) 
     
-    # Tell OpenCV to read the camera via GStreamer
     cap = cv2.VideoCapture(ingest_pipe, cv2.CAP_GSTREAMER)
     
     if not cap.isOpened(): 
-        # Fallback for older Raspberry Pi operating systems
-        print("libcamerasrc failed, trying legacy v4l2src...")
-        legacy_pipe = (
-            f"v4l2src device=/dev/video0 ! video/x-raw, width={W}, height={H}, framerate={TARGET_FPS}/1 "
-            f"! videoconvert ! appsink drop=true max-buffers=1"
-        )
-        cap = cv2.VideoCapture(legacy_pipe, cv2.CAP_GSTREAMER)
-        
-        if not cap.isOpened():
-            raise RuntimeError("Could not open OV5647 camera via GStreamer.")
+        raise RuntimeError("Could not open ArduCAM via libcamerasrc. Check ribbon connection.")
     
     encoder = EncoderThread(OUTPUT_PATH, W, H, TARGET_FPS)
     encoder.start()
@@ -236,14 +163,16 @@ def run_live():
     
     pipeline = ShlumboPipeline()
     
-    print("Live stream active. Press Ctrl+C to stop.")
+    print(f"Live UDP stream active on {OUTPUT_PATH}:5000. Press Ctrl+C to stop.")
 
     try:
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret: 
+                print("\n[!] ERROR: Camera connected, but returned an empty frame.")
+                break
             
-            out, _ = pipeline.process(frame)
+            out = pipeline.process(frame)
             if out is None: continue
             
             encoder.submit(out)
@@ -254,6 +183,28 @@ def run_live():
     finally:
         encoder.stop()
         cap.release()
+
+# --- BENCHMARK MODE ---
+def run_benchmark():
+    print(f"\nSHLUMBO V3 Benchmark ({W}x{H} @ {TARGET_FPS} fps)\n")
+    encoder = EncoderThread(OUTPUT_PATH, W, H, TARGET_FPS)
+    encoder.start()
+    time.sleep(0.5)
+
+    cam = SyntheticCamera()
+    pipeline = ShlumboPipeline()
+
+    for _ in range(WARMUP_FRAMES):
+        pipeline.process(cam.read()[1])
+
+    t_start = time.perf_counter()
+    while (time.perf_counter() - t_start < BENCH_SECONDS):
+        _, frame = cam.read()
+        out = pipeline.process(frame)
+        if out is not None: encoder.submit(out)
+
+    encoder.stop()
+    print(f"-> Est Enc: {encoder.backend} | Dropped: {encoder.dropped}")
 
 if __name__ == "__main__":
     if BENCH_MODE:
