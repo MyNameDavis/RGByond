@@ -9,14 +9,16 @@ import os
 
 # --- CONFIGURATION ---
 W, H, TARGET_FPS = 320, 240, 24
-OUTPUT_PATH = "shlumbo_out.mp4"
+OUTPUT_PATH = "10.0.0.253" #"shlumbo_out.mp4"
 BENCH_MODE, BENCH_SECONDS, WARMUP_FRAMES = True, 10, 30
 _PI4B_REF = {'resize_gray': 0.013, 'motion': 0.008, 'color_lut': 0.010}
 
 # --- ENCODER THREAD ---
+# --- ENCODER THREAD ---
 class EncoderThread(threading.Thread):
-    _GSTR_HW = 'appsrc ! videoconvert ! v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! h264parse ! mp4mux ! filesink location={path}'
-    _GSTR_SW = 'appsrc ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency ! mp4mux ! filesink location={path}'
+    # Replaced mp4mux and filesink with mpegtsmux and udpsink
+    _GSTR_HW = 'appsrc ! videoconvert ! v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! h264parse ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
+    _GSTR_SW = 'appsrc ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency ! mpegtsmux ! udpsink host={path} port=5000 sync=false'
 
     def __init__(self, path, width, height, fps):
         super().__init__(daemon=True)
